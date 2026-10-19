@@ -17,7 +17,7 @@ import io
 import base64
 
 from ..core.base_node import BaseImageNode
-from ..core.mask_utils import apply_mask_to_image, blur_mask
+from ..core.mask_utils import apply_mask_to_image
 from ..core.generic_preset_manager import GenericPresetManager
 
 # 创建Camera Raw预设管理器实例
@@ -216,6 +216,7 @@ class CameraRawEnhanceNode(BaseImageNode):
                                 # 遮罩
                                 mask=None, mask_blur=0.0, invert_mask=False, unique_id=None):
         """应用Camera Raw增强效果"""
+        image = image.float()
         # 性能优化：如果所有参数都是默认值且没有遮罩，直接返回原图
         all_params_default = (
             exposure == 0 and highlights == 0 and shadows == 0 and whites == 0 and blacks == 0 and
@@ -254,7 +255,7 @@ class CameraRawEnhanceNode(BaseImageNode):
                     exposure, highlights, shadows, whites, blacks,
                     temperature, tint, vibrance, saturation,
                     contrast, texture, clarity, dehaze, blend, overall_strength,
-                    mask, mask_blur, invert_mask
+                    mask=mask, mask_blur=mask_blur, invert_mask=invert_mask
                 ),)
             else:
                 result = self._process_single_image(
@@ -280,6 +281,7 @@ class CameraRawEnhanceNode(BaseImageNode):
         device = image.device
         
         # 转换为numpy进行处理
+        image = image.float()
         img_np = image.detach().cpu().numpy()
         
         # 保存原始图像
@@ -349,59 +351,30 @@ class CameraRawEnhanceNode(BaseImageNode):
         img_np = np.clip(img_np, 0, 1)
         
         # 转换回tensor
-        result = torch.from_numpy(img_np).to(device)
+        result = torch.from_numpy(np.asarray(img_np, dtype=np.float32)).to(device)
         
         # 应用遮罩
         if mask is not None:
+            if mask.dim() == 3 and mask.shape[0] == 1:
+                mask = mask[0]
             if mask_blur > 0:
-                mask = blur_mask(mask, mask_blur)
-            result = apply_mask_to_image(image, result, mask, invert_mask)
+                mask_array = mask.detach().cpu().float().numpy()
+                kernel = max(3, int(mask_blur * 2) * 2 + 1)
+                mask_array = cv2.GaussianBlur(mask_array, (kernel, kernel), mask_blur)
+                mask = torch.from_numpy(mask_array).to(device)
+            result = apply_mask_to_image(image, result, mask.to(device=device, dtype=torch.float32), invert_mask)
         
         return result
     
     def _apply_texture(self, image, texture_strength):
-        """应用纹理增强 - 增强中等大小细节的对比度"""
-        # 转换为uint8进行处理
-        img_uint8 = (image * 255).astype(np.uint8)
-        
-        # 创建中等频率的滤波器
-        # 使用高斯模糊创建低频版本
-        low_freq = cv2.GaussianBlur(img_uint8, (0, 0), sigmaX=2.0, sigmaY=2.0)
-        
-        # 创建高频版本
-        high_freq = cv2.GaussianBlur(img_uint8, (0, 0), sigmaX=0.5, sigmaY=0.5)
-        
-        # 提取中频细节
-        mid_freq = img_uint8.astype(np.float32) - low_freq.astype(np.float32) + 128
-        
-        # 应用纹理增强
-        texture_factor = texture_strength / 100.0
-        enhanced = img_uint8.astype(np.float32) + (mid_freq - 128) * texture_factor
-        
-        # 转换回0-1范围
-        enhanced = np.clip(enhanced, 0, 255) / 255.0
-        
-        return enhanced
+        """Enhance medium-frequency detail without integer quantization."""
+        low = cv2.GaussianBlur(image, (0, 0), sigmaX=2.0, sigmaY=2.0)
+        return np.clip(image + (image - low) * (texture_strength / 100.0), 0, 1)
     
     def _apply_clarity(self, image, clarity_strength):
-        """应用清晰度增强 - 增强中间调对比度"""
-        # 转换为uint8进行处理
-        img_uint8 = (image * 255).astype(np.uint8)
-        
-        # 创建模糊版本用于对比
-        blurred = cv2.GaussianBlur(img_uint8, (0, 0), sigmaX=10.0, sigmaY=10.0)
-        
-        # 计算对比度差异
-        contrast_diff = img_uint8.astype(np.float32) - blurred.astype(np.float32)
-        
-        # 应用清晰度增强
-        clarity_factor = clarity_strength / 100.0
-        enhanced = img_uint8.astype(np.float32) + contrast_diff * clarity_factor
-        
-        # 转换回0-1范围
-        enhanced = np.clip(enhanced, 0, 255) / 255.0
-        
-        return enhanced
+        """Enhance local contrast in float32."""
+        blurred = cv2.GaussianBlur(image, (0, 0), sigmaX=10.0, sigmaY=10.0)
+        return np.clip(image + (image - blurred) * (clarity_strength / 100.0), 0, 1)
     
     # === 新增的Camera Raw调整算法 ===
     
@@ -422,7 +395,7 @@ class CameraRawEnhanceNode(BaseImageNode):
             return image
         
         # 计算亮度
-        luminance = np.dot(image, [0.299, 0.587, 0.114])
+        luminance = np.dot(image, np.array([0.299, 0.587, 0.114], dtype=np.float32))
         
         # 创建更精确的高光遮罩，类似PS的处理方式
         # 使用S形曲线确定高光区域
@@ -442,7 +415,7 @@ class CameraRawEnhanceNode(BaseImageNode):
         
         if highlights_value < 0:
             # 负值：压制高光，使用更激进的衰减
-            factor = np.power(1.0 + adjustment, 1.2)  # 非线性衰减
+            factor = (1.0 + adjustment) ** 1.2  # 非线性衰减
             result = image * (1 - highlight_mask) + image * factor * highlight_mask
         else:
             # 正值：恢复高光细节，更温和的处理
@@ -457,7 +430,7 @@ class CameraRawEnhanceNode(BaseImageNode):
             return image
         
         # 计算亮度
-        luminance = np.dot(image, [0.299, 0.587, 0.114])
+        luminance = np.dot(image, np.array([0.299, 0.587, 0.114], dtype=np.float32))
         
         # 创建更精确的阴影遮罩，类似PS的处理方式
         shadow_threshold = 0.3  # 阴影阈值
@@ -483,7 +456,7 @@ class CameraRawEnhanceNode(BaseImageNode):
             result = image * (1 - shadow_mask) + lifted_image * shadow_mask
         else:
             # 负值：压暗阴影，使用更强的压暗
-            factor = np.power(1.0 + adjustment, 0.8)  # 非线性压暗
+            factor = (1.0 + adjustment) ** 0.8  # 非线性压暗
             result = image * (1 - shadow_mask) + image * factor * shadow_mask
         
         return np.clip(result, 0, 1)
@@ -497,7 +470,7 @@ class CameraRawEnhanceNode(BaseImageNode):
         adjustment = whites_value / 100.0
         
         # 计算亮度
-        luminance = np.dot(image, [0.299, 0.587, 0.114])
+        luminance = np.dot(image, np.array([0.299, 0.587, 0.114], dtype=np.float32))
         
         # 创建白色权重遮罩，主要影响中间调到高光
         # 使用S形曲线，更符合PS的处理方式
@@ -525,7 +498,7 @@ class CameraRawEnhanceNode(BaseImageNode):
         adjustment = blacks_value / 100.0
         
         # 计算亮度
-        luminance = np.dot(image, [0.299, 0.587, 0.114])
+        luminance = np.dot(image, np.array([0.299, 0.587, 0.114], dtype=np.float32))
         
         # 创建黑色权重遮罩，主要影响阴影到中间调
         # 使用反向S形曲线，强调暗部
@@ -598,50 +571,23 @@ class CameraRawEnhanceNode(BaseImageNode):
         
         # 轻微的归一化，防止过度饱和
         max_channel = np.max(result, axis=2, keepdims=True)
-        over_saturated = max_channel > 1.0
-        result[over_saturated] = result[over_saturated] / max_channel[over_saturated]
+        result = result / np.maximum(max_channel, 1.0)
         
         return np.clip(result, 0, 1)
     
     def _apply_vibrance(self, image, vibrance_value):
-        """应用自然饱和度调整 - 智能饱和度"""
+        """Use OpenCV float HSV: hue 0–360, saturation/value 0–1."""
         if vibrance_value == 0:
             return image
-        
-        # 转换到HSV空间进行处理
-        img_uint8 = (image * 255).astype(np.uint8)
-        hsv = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2HSV).astype(np.float32)
-        h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-        
-        # 自然饱和度的特点：对已经饱和的颜色影响较小
+        hsv = cv2.cvtColor(np.ascontiguousarray(image, dtype=np.float32), cv2.COLOR_RGB2HSV)
+        h, s = hsv[:, :, 0], hsv[:, :, 1]
+        protection = 1.0 - s ** 2
+        skin = ((h >= 10) & (h <= 60)) | ((h >= 320) & (h <= 360))
+        protection[skin] *= 0.3
         adjustment = vibrance_value / 100.0
-        
-        # 创建保护遮罩：已经高饱和度的区域受到保护
-        saturation_mask = 1.0 - (s / 255.0) ** 2  # 高饱和度区域权重小
-        
-        # 肤色保护：减少对肤色的影响
-        # 肤色在HSV中大约在色相10-25度范围
-        skin_mask = np.ones_like(h)
-        skin_hue_range = ((h >= 5) & (h <= 30)) | ((h >= 160) & (h <= 180))
-        skin_mask[skin_hue_range] = 0.3  # 肤色区域减少影响
-        
-        # 综合遮罩
-        final_mask = saturation_mask * skin_mask
-        
-        if adjustment > 0:
-            # 正值：增加自然饱和度
-            s_enhanced = s + adjustment * 120 * final_mask
-        else:
-            # 负值：减少饱和度
-            s_enhanced = s + adjustment * 255 * final_mask
-        
-        s_enhanced = np.clip(s_enhanced, 0, 255)
-        
-        # 重新组合HSV
-        hsv_enhanced = np.stack([h, s_enhanced, v], axis=2)
-        result_uint8 = cv2.cvtColor(hsv_enhanced.astype(np.uint8), cv2.COLOR_HSV2RGB)
-        
-        return result_uint8.astype(np.float32) / 255.0
+        amount = adjustment * (120.0 / 255.0 if adjustment > 0 else 1.0)
+        hsv[:, :, 1] = np.clip(s + amount * protection, 0, 1)
+        return np.clip(cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB), 0, 1)
     
     def _apply_saturation(self, image, saturation_value):
         """应用饱和度调整 - 整体饱和度"""
@@ -649,7 +595,7 @@ class CameraRawEnhanceNode(BaseImageNode):
             return image
         
         # 计算灰度版本
-        gray = np.dot(image, [0.299, 0.587, 0.114])
+        gray = np.dot(image, np.array([0.299, 0.587, 0.114], dtype=np.float32))
         
         # 饱和度调整
         adjustment = saturation_value / 100.0
@@ -1251,7 +1197,7 @@ class CameraRawEnhanceNode(BaseImageNode):
         dehazed = np.power(image, gamma)
         
         # 降低饱和度
-        gray = np.dot(dehazed, [0.299, 0.587, 0.114])
+        gray = np.dot(dehazed, np.array([0.299, 0.587, 0.114], dtype=np.float32))
         desaturated = dehazed * (1 - strength * 0.3) + gray[..., np.newaxis] * strength * 0.3
         
         # 添加大气光
